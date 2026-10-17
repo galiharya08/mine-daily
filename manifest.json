@@ -1,8 +1,8 @@
 {
   "name": "Mine - Personal Life Planner",
   "short_name": "Mine",
-  "start_url": "./",
-  "scope": "./",
+  "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#edf0e8",
   "theme_color": "#81b256",

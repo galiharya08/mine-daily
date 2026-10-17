@@ -1012,22 +1012,161 @@ const STORES={
 };
 let db=null,useFallback=false;
 const LS_PREFIX='ruang:';
+const SNAPSHOT_KEY='mine:emergency_snapshot_v1';
+
 function lsKey(s){return LS_PREFIX+s}
 function lsReadAll(s){try{return JSON.parse(localStorage.getItem(lsKey(s)))||[]}catch{return[]}}
-function lsWriteAll(s,arr){localStorage.setItem(lsKey(s),JSON.stringify(arr))}
+function lsWriteAll(s,arr){try{localStorage.setItem(lsKey(s),JSON.stringify(arr))}catch(e){console.warn('Storage full',e)}}
 function clearFallbackStore(store){if(store==='settings'){Object.keys(localStorage).filter(k=>k.startsWith(LS_PREFIX+'setting:')).forEach(k=>localStorage.removeItem(k));localStorage.removeItem(lsKey('settings'));return}lsWriteAll(store,[])}
-function openDB(){return new Promise((res,rej)=>{if(!('indexedDB'in window))return rej(new Error(_i18n("IndexedDB tidak tersedia")));const r=indexedDB.open(DB_NAME,DB_VER);r.onupgradeneeded=e=>{const d=e.target.result;Object.entries(STORES).forEach(([name,def])=>{if(!d.objectStoreNames.contains(name)){const s=d.createObjectStore(name,{keyPath:def.keyPath});(def.indexes||[]).forEach(ix=>s.createIndex(ix,ix,{unique:false}))}})};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);r.onblocked=()=>rej(new Error(_i18n("IndexedDB terblokir")))})}
-function tx(store,mode='readonly'){return db.transaction(store,mode).objectStore(store)}
-async function dbGetAll(store){if(useFallback)return lsReadAll(store);return new Promise((res,rej)=>{const r=tx(store).getAll();r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
-async function dbPut(store,val){if(useFallback){const arr=lsReadAll(store);const kp=STORES[store].keyPath;const i=arr.findIndex(x=>x[kp]===val[kp]);if(i>=0)arr[i]=val;else arr.push(val);lsWriteAll(store,arr);return val}return new Promise((res,rej)=>{const s=tx(store,'readwrite');const r=s.put(val);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
-async function dbPutMany(store,vals){if(useFallback){const arr=lsReadAll(store);const kp=STORES[store].keyPath;vals.forEach(v=>{const i=arr.findIndex(x=>x[kp]===v[kp]);if(i>=0)arr[i]=v;else arr.push(v)});lsWriteAll(store,arr);return}return new Promise((res,rej)=>{const t=db.transaction(store,'readwrite'),s=t.objectStore(store);vals.forEach(v=>s.put(v));t.oncomplete=()=>res();t.onerror=()=>rej(t.error)})}
-async function dbDelete(store,key){if(useFallback){lsWriteAll(store,lsReadAll(store).filter(x=>x[STORES[store].keyPath]!==key));return}return new Promise((res,rej)=>{const r=tx(store,'readwrite').delete(key);r.onsuccess=()=>res();r.onerror=()=>rej(r.error)})}
-async function dbClear(store){if(useFallback){clearFallbackStore(store);return}return new Promise((res,rej)=>{const r=tx(store,'readwrite').clear();r.onsuccess=()=>res();r.onerror=()=>rej(r.error)})}
+
+function openDB(){
+  return new Promise((res,rej)=>{
+    if(!('indexedDB'in window))return rej(new Error(_i18n("IndexedDB tidak tersedia")));
+    const r=indexedDB.open(DB_NAME,DB_VER);
+    r.onupgradeneeded=e=>{
+      const d=e.target.result;
+      Object.entries(STORES).forEach(([name,def])=>{
+        if(!d.objectStoreNames.contains(name)){
+          const s=d.createObjectStore(name,{keyPath:def.keyPath});
+          (def.indexes||[]).forEach(ix=>s.createIndex(ix,ix,{unique:false}));
+        }
+      });
+    };
+    r.onsuccess=()=>{
+      const d=r.result;
+      // Deteksi otomatis jika Android menutup koneksi di background
+      d.onclose=()=>{db=null};
+      d.onversionchange=()=>{d.close();db=null};
+      res(d);
+    };
+    r.onerror=()=>rej(r.error);
+    r.onblocked=()=>rej(new Error(_i18n("IndexedDB terblokir")));
+  });
+}
+
+// Fungsi pengaman: memastikan koneksi DB selalu hidup sebelum baca/tulis
+async function ensureDB(){
+  if(useFallback)return null;
+  if(db)return db;
+  try{
+    db=await openDB();
+    return db;
+  }catch(e){
+    console.warn('Re-open DB gagal, mencoba sekali lagi...',e);
+    await new Promise(r=>setTimeout(r,150));
+    db=await openDB();
+    return db;
+  }
+}
+
+async function dbGetAll(store){
+  if(useFallback)return lsReadAll(store);
+  try{
+    const d=await ensureDB();
+    return await new Promise((res,rej)=>{
+      const r=d.transaction(store,'readonly').objectStore(store).getAll();
+      r.onsuccess=()=>res(r.result);
+      r.onerror=()=>rej(r.error);
+    });
+  }catch(e){
+    db=null;
+    const d=await ensureDB();
+    return await new Promise((res,rej)=>{
+      const r=d.transaction(store,'readonly').objectStore(store).getAll();
+      r.onsuccess=()=>res(r.result);
+      r.onerror=()=>rej(r.error);
+    });
+  }
+}
+
+async function dbPut(store,val){
+  if(useFallback){
+    const arr=lsReadAll(store);const kp=STORES[store].keyPath;
+    const i=arr.findIndex(x=>x[kp]===val[kp]);
+    if(i>=0)arr[i]=val;else arr.push(val);
+    lsWriteAll(store,arr);return val;
+  }
+  const d=await ensureDB();
+  const res=await new Promise((resolve,rej)=>{
+    const s=d.transaction(store,'readwrite').objectStore(store);
+    const r=s.put(val);
+    r.onsuccess=()=>resolve(r.result);
+    r.onerror=()=>rej(r.error);
+  });
+  scheduleEmergencySnapshot();
+  return res;
+}
+
+async function dbPutMany(store,vals){
+  if(useFallback){
+    const arr=lsReadAll(store);const kp=STORES[store].keyPath;
+    vals.forEach(v=>{const i=arr.findIndex(x=>x[kp]===v[kp]);if(i>=0)arr[i]=v;else arr.push(v)});
+    lsWriteAll(store,arr);return;
+  }
+  const d=await ensureDB();
+  await new Promise((res,rej)=>{
+    const t=d.transaction(store,'readwrite'),s=t.objectStore(store);
+    vals.forEach(v=>s.put(v));
+    t.oncomplete=()=>res();
+    t.onerror=()=>rej(t.error);
+  });
+  scheduleEmergencySnapshot();
+}
+
+async function dbDelete(store,key){
+  if(useFallback){lsWriteAll(store,lsReadAll(store).filter(x=>x[STORES[store].keyPath]!==key));return}
+  const d=await ensureDB();
+  await new Promise((res,rej)=>{
+    const r=d.transaction(store,'readwrite').objectStore(store).delete(key);
+    r.onsuccess=()=>res();
+    r.onerror=()=>rej(r.error);
+  });
+  scheduleEmergencySnapshot();
+}
+
+async function dbClear(store){
+  if(useFallback){clearFallbackStore(store);return}
+  const d=await ensureDB();
+  return new Promise((res,rej)=>{
+    const r=d.transaction(store,'readwrite').objectStore(store).clear();
+    r.onsuccess=()=>res();
+    r.onerror=()=>rej(r.error);
+  });
+}
+
 async function getSetting(key,fallback=null){
   if(useFallback){try{const raw=localStorage.getItem(LS_PREFIX+'setting:'+key);return raw===null?fallback:JSON.parse(raw)}catch{return fallback}}
-  return new Promise(res=>{const req=tx('settings').get(key);req.onsuccess=()=>res(req.result&&req.result.value!==undefined?req.result.value:fallback);req.onerror=()=>res(fallback)});
+  try{
+    const d=await ensureDB();
+    return await new Promise(res=>{
+      const req=d.transaction('settings','readonly').objectStore('settings').get(key);
+      req.onsuccess=()=>res(req.result&&req.result.value!==undefined?req.result.value:fallback);
+      req.onerror=()=>res(fallback);
+    });
+  }catch{return fallback}
 }
-async function setSetting(key,value){if(useFallback){localStorage.setItem(LS_PREFIX+'setting:'+key,JSON.stringify(value));return}return dbPut('settings',{key,value})}
+
+async function setSetting(key,value){
+  if(useFallback){try{localStorage.setItem(LS_PREFIX+'setting:'+key,JSON.stringify(value))}catch{}return}
+  const res=await dbPut('settings',{key,value});
+  try{if(key==='name'||key==='theme'||key==='lang'||key==='welcomeSeen'||key==='tutorialSeen')localStorage.setItem(LS_PREFIX+'setting:'+key,JSON.stringify(value))}catch{}
+  return res;
+}
+
+// Mencadangkan data penting secara otomatis ke localStorage sebagai pelampung darurat
+let _snapTimer=null;
+function scheduleEmergencySnapshot(){
+  clearTimeout(_snapTimer);
+  _snapTimer=setTimeout(()=>{
+    try{
+      if(!bootReady)return;
+      const snap={ts:Date.now(),name:S.name,data:{}};
+      let count=0;
+      ALL_KEYS.forEach(k=>{snap.data[k]=S[k]||[];count+=snap.data[k].length});
+      if(count>0)localStorage.setItem(SNAPSHOT_KEY,JSON.stringify(snap));
+    }catch(e){console.warn('Snapshot skip:',e)}
+  },1200);
+}
 
 /* ============ helpers ============ */
 const uid=p=>p+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7);
@@ -2745,12 +2884,46 @@ onbTutorial.addEventListener('click',e=>{if(e.target===onbTutorial)onbClose()});
 // Sengaja tidak ada klik-luar untuk welcome: user baru harus menekan Mulai.
 
 /* ============ boot ============ */
+async function requestPersistentStorage(){
+  if(navigator.storage&&navigator.storage.persist){
+    try{
+      const isPersisted=await navigator.storage.persisted();
+      if(!isPersisted)await navigator.storage.persist();
+    }catch(e){console.warn('Persist storage error:',e)}
+  }
+}
+
 (async()=>{
   try{
+    await requestPersistentStorage();
     try{db=await openDB()}
     catch(idbErr){console.warn(_i18n("IndexedDB gagal, memakai localStorage:"),idbErr);useFallback=true}
     await seedIfEmpty();
     await loadAll();
+
+    // AUTO-RECOVERY: Jika IndexedDB tiba-tiba kosong padahal ada Snapshot darurat, pulihkan otomatis!
+    const totalLoaded=ALL_KEYS.reduce((a,k)=>a+(S[k]?S[k].length:0),0);
+    if(totalLoaded===0){
+      try{
+        const rawSnap=localStorage.getItem(SNAPSHOT_KEY);
+        if(rawSnap){
+          const snap=JSON.parse(rawSnap);
+          if(snap&&snap.data){
+            for(const k of ALL_KEYS){
+              if(Array.isArray(snap.data[k])&&snap.data[k].length){
+                await dbPutMany(k,snap.data[k]);
+              }
+            }
+            if(snap.name)await setSetting('name',snap.name);
+            await setSetting('welcomeSeen','1');
+            await setSetting('tutorialSeen','1');
+            await loadAll();
+            toast(_i18n("Data dipulihkan otomatis dari cadangan lokal"));
+          }
+        }
+      }catch(recErr){console.warn('Auto-recovery gagal:',recErr)}
+    }
+
     const savedTypes=await getSetting('eventTypes',null);if(Array.isArray(savedTypes))EVENT_TYPES.splice(0,EVENT_TYPES.length,...savedTypes);
     const tbTypes=await getSetting('timeBlockTypes',null);if(Array.isArray(tbTypes)&&tbTypes.length)TB_TYPES=[...new Set([...DEFAULT_TB_TYPES,...tbTypes])];
     const fitTypes=await getSetting('fitnessTypes',null);if(Array.isArray(fitTypes)&&fitTypes.length)FITNESS_TYPES=[...new Set([...DEFAULT_FITNESS_TYPES,...fitTypes])];
@@ -2760,12 +2933,22 @@ onbTutorial.addEventListener('click',e=>{if(e.target===onbTutorial)onbClose()});
     const n=new Date();calY=n.getFullYear();calD=n;
     renderAll();
     bootReady=true;
-    // Onboarding hanya tampil di atas planner yang sudah siap, jadi tidak
-    // menunda waktu render pertama.
+    scheduleEmergencySnapshot();
     await onbDecide();
     if(useFallback)toast(_i18n("Mode hemat aktif: data disimpan di localStorage browser ini"));
   }catch(err){console.error(err);document.body.insertAdjacentHTML('afterbegin',_i18n("<div style=\"padding:16px 20px;background:#f5e0e0;color:#a84343\">Gagal memuat data lokal: ")+esc(err.message)+'</div>')}
 })();
+
+// Saat aplikasi dibuka kembali dari background di HP Android, cek ulang koneksi DB
+document.addEventListener('visibilitychange',async()=>{
+  if(document.visibilityState==='visible'&&bootReady){
+    try{
+      await ensureDB();
+      await loadAll();
+      renderAll();
+    }catch(e){console.warn('Resume sync error:',e)}
+  }
+});
 </script>
 <script>
   if ('serviceWorker' in navigator) {
